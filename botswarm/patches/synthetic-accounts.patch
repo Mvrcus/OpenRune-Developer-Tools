@@ -1,0 +1,89 @@
+diff --git a/api/net/src/main/kotlin/org/rsmod/api/net/rsprot/NetworkScript.kt b/api/net/src/main/kotlin/org/rsmod/api/net/rsprot/NetworkScript.kt
+index 7d2da941b..a0a6277c5 100644
+--- a/api/net/src/main/kotlin/org/rsmod/api/net/rsprot/NetworkScript.kt
++++ b/api/net/src/main/kotlin/org/rsmod/api/net/rsprot/NetworkScript.kt
+@@ -24,6 +24,7 @@ import org.rsmod.game.entity.Npc
+ import org.rsmod.game.entity.Player
+ import org.rsmod.game.entity.npc.NpcStateEvents
+ import org.rsmod.game.entity.player.SessionStateEvent
++import org.rsmod.game.entity.player.isSyntheticAccount
+ import org.rsmod.plugin.scripts.PluginScript
+ import org.rsmod.plugin.scripts.ScriptContext
+ 
+@@ -62,9 +63,13 @@ constructor(
+             openRuneCentral.stopInboundWatch()
+             centralActivityLogWriter.stop()
+         }
+-        onEvent<HeldDropEvents.Drop> { centralActivityLogWriter.logItemDrop(player, type, obj) }
++        onEvent<HeldDropEvents.Drop> {
++            if (!player.isSyntheticAccount) centralActivityLogWriter.logItemDrop(player, type, obj)
++        }
+         onEvent<HeldDropEvents.Destroy> {
+-            centralActivityLogWriter.logItemDestroy(player, type, obj)
++            if (!player.isSyntheticAccount) {
++                centralActivityLogWriter.logItemDestroy(player, type, obj)
++            }
+         }
+         onEvent<GameLifecycle.UpdateInfo> { updateService() }
+         onEvent<SessionStart> { startSession() }
+@@ -157,6 +162,8 @@ constructor(
+     }
+ 
+     private fun SessionStateEvent.Login.markDbOnlineSession() {
++        // Headless bots have no character row and must not appear in Central's activity log.
++        if (player.isSyntheticAccount) return
+         runBlocking {
+             try {
+                 database.withTransaction { connection ->
+@@ -176,6 +183,7 @@ constructor(
+     }
+ 
+     private fun SessionStateEvent.Logout.notifyCentralLogout() {
++        if (player.isSyntheticAccount) return
+         centralActivityLogWriter.logPlayerLogout(player)
+         runBlocking {
+             try {
+diff --git a/api/registry/src/main/kotlin/org/rsmod/api/registry/account/AccountRegistry.kt b/api/registry/src/main/kotlin/org/rsmod/api/registry/account/AccountRegistry.kt
+index 952ef4a9b..84045b7af 100644
+--- a/api/registry/src/main/kotlin/org/rsmod/api/registry/account/AccountRegistry.kt
++++ b/api/registry/src/main/kotlin/org/rsmod/api/registry/account/AccountRegistry.kt
+@@ -8,6 +8,7 @@ import org.rsmod.api.account.saver.request.AccountSaveResponse
+ import org.rsmod.api.registry.player.PlayerRegistry
+ import org.rsmod.events.EventBus
+ import org.rsmod.game.entity.Player
++import org.rsmod.game.entity.player.isSyntheticAccount
+ 
+ public class AccountRegistry
+ @Inject
+@@ -29,6 +30,11 @@ constructor(
+     }
+ 
+     public fun queueLogout(player: Player) {
++        if (player.isSyntheticAccount) {
++            // Headless bots have no account row to save into; go straight to removal.
++            pendingLogouts.add(QueuedLogout(player, ::handleLogout))
++            return
++        }
+         accountManager.save(player, ::queueSaveResponse)
+     }
+ 
+diff --git a/engine/game/src/main/kotlin/org/rsmod/game/entity/player/SyntheticAccount.kt b/engine/game/src/main/kotlin/org/rsmod/game/entity/player/SyntheticAccount.kt
+new file mode 100644
+index 000000000..e581ae31b
+--- /dev/null
++++ b/engine/game/src/main/kotlin/org/rsmod/game/entity/player/SyntheticAccount.kt
+@@ -0,0 +1,14 @@
++package org.rsmod.game.entity.player
++
++import org.rsmod.game.entity.Player
++
++/**
++ * `true` for a player with no backing account row: a headless test bot (`content/other/botswarm`)
++ * spawned with a non-positive character id. Real characters always have `characterId > 0`.
++ *
++ * Every path that persists a player or reports it to Central must skip these, or a bot could
++ * overwrite (or fail foreign keys against) real account data. Autosave already uses the same rule:
++ * `PlayerAutosaveOrchestrator.persistenceSaveEligible` requires `accountId > 0 && characterId > 0`.
++ */
++public val Player.isSyntheticAccount: Boolean
++    get() = characterId <= 0

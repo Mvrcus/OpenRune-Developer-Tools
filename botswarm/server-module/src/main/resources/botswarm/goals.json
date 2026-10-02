@@ -1,0 +1,215 @@
+[
+  {
+    "id": "fish-shrimp-draynor",
+    "description": "Net shrimp at the Draynor fishing spots",
+    "start": {
+      "x": 3087,
+      "z": 3229,
+      "scatter": 2
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "inventory": [
+      {
+        "obj": "obj.net"
+      }
+    ],
+    "budget_ticks": 3000,
+    "success": {
+      "type": "xp_gained",
+      "stat": "stat.fishing",
+      "xp": 300
+    },
+    "prefer": [
+      "Net"
+    ],
+    "avoid": [
+      "Bank",
+      "Collect",
+      "Trade",
+      "Pickpocket"
+    ],
+    "roam_radius": 12
+  },
+  {
+    "id": "fish-swamp-lumbridge",
+    "description": "Net shrimp at the Lumbridge Swamp fishing spots",
+    "start": {
+      "x": 3242,
+      "z": 3150,
+      "scatter": 2
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "inventory": [
+      {
+        "obj": "obj.net"
+      }
+    ],
+    "budget_ticks": 3000,
+    "success": {
+      "type": "xp_gained",
+      "stat": "stat.fishing",
+      "xp": 300
+    },
+    "prefer": [
+      "Net"
+    ],
+    "avoid": [
+      "Trade",
+      "Pickpocket"
+    ],
+    "roam_radius": 12
+  },
+  {
+    "id": "chop-trees-lumbridge",
+    "description": "Chop trees around Lumbridge",
+    "start": {
+      "x": 3192,
+      "z": 3240,
+      "scatter": 3
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "inventory": [
+      {
+        "obj": "obj.bronze_axe"
+      }
+    ],
+    "budget_ticks": 3000,
+    "success": {
+      "type": "xp_gained",
+      "stat": "stat.woodcutting",
+      "xp": 250
+    },
+    "prefer": [
+      "Chop down"
+    ],
+    "avoid": [
+      "Trade",
+      "Pickpocket"
+    ],
+    "roam_radius": 25
+  },
+  {
+    "id": "kill-cows-lumbridge",
+    "description": "Fight cows in the Lumbridge cow field",
+    "start": {
+      "x": 3255,
+      "z": 3268,
+      "scatter": 3
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "stats": {
+      "stat.attack": 5,
+      "stat.strength": 5,
+      "stat.defence": 5,
+      "stat.hitpoints": 15
+    },
+    "inventory": [
+      {
+        "obj": "obj.bronze_sword"
+      }
+    ],
+    "budget_ticks": 3000,
+    "success": {
+      "type": "xp_gained",
+      "stat": "stat.hitpoints",
+      "xp": 150
+    },
+    "prefer": [
+      "Attack",
+      "Wield",
+      "Take"
+    ],
+    "avoid": [
+      "Trade",
+      "Pickpocket"
+    ],
+    "roam_radius": 15
+  },
+  {
+    "id": "kill-chickens-lumbridge",
+    "description": "Fight chickens at the Lumbridge farm and pick up the loot",
+    "start": {
+      "x": 3180,
+      "z": 3297,
+      "scatter": 3
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "budget_ticks": 2500,
+    "success": {
+      "type": "xp_gained",
+      "stat": "stat.hitpoints",
+      "xp": 100
+    },
+    "prefer": [
+      "Attack",
+      "Take",
+      "Bury"
+    ],
+    "avoid": [
+      "Trade",
+      "Pickpocket"
+    ],
+    "roam_radius": 12
+  },
+  {
+    "id": "explore-lumbridge",
+    "description": "Open-ended exploration of Lumbridge: click everything, maximise op coverage",
+    "start": {
+      "x": 3222,
+      "z": 3218,
+      "scatter": 4
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "stats": {
+      "stat.hitpoints": 30,
+      "stat.defence": 20
+    },
+    "budget_ticks": 3000,
+    "avoid": [
+      "Pickpocket"
+    ],
+    "roam_radius": 40,
+    "novelty": 0.7
+  },
+  {
+    "id": "explore-draynor",
+    "description": "Open-ended exploration of Draynor Village",
+    "start": {
+      "x": 3093,
+      "z": 3248,
+      "scatter": 4
+    },
+    "varbits": {
+      "10662": 21,
+      "10663": 1
+    },
+    "stats": {
+      "stat.hitpoints": 30,
+      "stat.defence": 20
+    },
+    "budget_ticks": 3000,
+    "avoid": [
+      "Pickpocket"
+    ],
+    "roam_radius": 35,
+    "novelty": 0.7
+  }
+]

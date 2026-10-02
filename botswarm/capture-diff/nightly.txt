@@ -1,0 +1,8 @@
+# Capture scenarios the nightly run replays. One manifest (flow) or scenario id per line.
+# Flows are extracted locally with find_flows.py into .data/botswarm/scenarios/.
+# Prefix `serial` for flows with cross-player state: they run one at a time.
+quick-prayer
+spec-orb
+serial relic-confirm
+serial relic-unlock-t8
+serial relic-unlock-t8-two-players
