@@ -70,6 +70,35 @@ dashboard — open it in a browser to watch what the AI is doing in real time:
 The page polls `GET /log?after=<id>` (same port) for new entries; the server keeps
 the last 100 calls in memory, so refreshing the page replays recent history.
 
+## Driving the client from a fast decision loop
+
+For automated testing on private servers you can run a loop of your own instead of a chat
+model: observe, pick an action, act, a few times per 600 ms game tick. What works:
+
+- **Read cheaply.** `get_combat_state` is the per-step read (fighting, moving, attackers,
+  prayers, tick). Leave screenshots and the `list_*` tools for when something changed.
+- **Act directly.** `interact_npc`, `item_action`, `set_prayer` and `pickup_item` invoke the
+  client's own menu action: no mouse movement and no tab has to be open, so they are safe to
+  fire mid-fight. Hover-based tools (`interact_object`, `widget_action`) need the target on
+  screen.
+- **One call at a time.** A new call cancels the one in flight, so keep your loop sequential.
+  Don't park on `wait_for` while something time-critical still needs polling.
+- **Keep reflexes in code.** Anything an if-statement can decide (switch prayer on an attack
+  animation from `get_effect_history`, eat below a threshold) should never wait on a model.
+- **Give the model choices, not freedom.** A small classifier picking from a short list of
+  concrete, labelled actions ("Attack Goblin (3 tiles)", "eat Shark") is fast and can't invent
+  an action that doesn't exist. Build the list from `list_npcs` / `list_objects` /
+  `get_inventory` (`inventoryActions`) / `get_dialogue`.
+
+```
+loop:
+    state = get_combat_state (+ whatever changed)
+    if reflex(state): act on it; continue
+    menu = candidate actions (labels + the tool call behind each)
+    pick = model.choose(state_text, labels)
+    call pick's tool
+```
+
 ## Releases
 
 Pushing to the `prod` branch builds the jar and publishes a GitHub release
@@ -89,6 +118,7 @@ automatically.
 | `set_widget` | Live-edit a widget client-side: move, resize, hide, retext, recolor, then revalidate |
 | `get_client_state` | Game state, canvas size, mouse, player position/region, energy, weight, camera, menu-open flag |
 | `get_skills` | All skills: level, boosted level, xp, total level |
+| `get_combat_state` | One cheap call: ticks since you were hit / last hit something, in combat, moving, walk destination, your target, NPCs attacking you, active prayers |
 
 ### Raw input
 
@@ -122,7 +152,8 @@ automatically.
 | `interact_npc` | Invoke a cache-defined NPC option (default Talk-to) |
 | `get_npc_menu` | Hover an NPC and read its live right-click menu, incl. server-added options |
 | `click_menu_option` | Click an entry of the currently built mini-menu |
-| `item_action` | Right-click an inventory item and click an option (Drop, Eat, Wield...) |
+| `item_action` | Invoke an inventory item's option (Drop, Eat, Wield...) directly; works with the inventory tab closed |
+| `set_prayer` | Turn a prayer on/off by name (`PROTECT_FROM_MAGIC`...) without opening the prayer tab |
 | `interact_object` | Nearest matching object, hover, click option (Chop down, Mine, Open...) |
 | `interact_player` | Hover a player and click an option (Trade with, Follow...) |
 | `widget_action` | Right-click any widget and click a menu option (spells, prayers, buttons) |
