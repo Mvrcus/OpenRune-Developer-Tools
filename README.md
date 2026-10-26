@@ -75,8 +75,9 @@ the last 100 calls in memory, so refreshing the page replays recent history.
 For automated testing on private servers you can run a loop of your own instead of a chat
 model: observe, pick an action, act, a few times per 600 ms game tick. What works:
 
-- **Read cheaply.** `get_combat_state` is the per-step read (fighting, moving, attackers,
-  prayers, tick). Leave screenshots and the `list_*` tools for when something changed.
+- **Read cheaply.** `observe` is the per-step read: one client-thread pass (~20 ms) instead of
+  a call per tool. `get_combat_state` is the lighter one for tight polls (fighting, moving,
+  attackers, prayers, tick).
 - **Act directly.** `interact_npc`, `item_action`, `set_prayer` and `pickup_item` invoke the
   client's own menu action: no mouse movement and no tab has to be open, so they are safe to
   fire mid-fight. Hover-based tools (`interact_object`, `widget_action`) need the target on
@@ -87,16 +88,15 @@ model: observe, pick an action, act, a few times per 600 ms game tick. What work
   animation from `get_effect_history`, eat below a threshold) should never wait on a model.
 - **Give the model choices, not freedom.** A small classifier picking from a short list of
   concrete, labelled actions ("Attack Goblin (3 tiles)", "eat Shark") is fast and can't invent
-  an action that doesn't exist. Build the list from `list_npcs` / `list_objects` /
-  `get_inventory` (`inventoryActions`) / `get_dialogue`.
+  an action that doesn't exist. `list_actions` builds that list from the client's own options;
+  trim it to what your loop should offer, then `act(id)`.
 
 ```
 loop:
-    state = get_combat_state (+ whatever changed)
-    if reflex(state): act on it; continue
-    menu = candidate actions (labels + the tool call behind each)
-    pick = model.choose(state_text, labels)
-    call pick's tool
+    menu = list_actions(includeObservation=true)      # one call: snapshot + numbered actions
+    if reflex(menu.observation): act on it; continue  # eat, pray, continue dialogue...
+    pick = model.choose(state_text, [a.label for a in menu.actions])
+    act(id=pick)                                      # refused if the menu went stale
 ```
 
 ## Releases
@@ -119,6 +119,14 @@ automatically.
 | `get_client_state` | Game state, canvas size, mouse, player position/region, energy, weight, camera, menu-open flag |
 | `get_skills` | All skills: level, boosted level, xp, total level |
 | `get_combat_state` | One cheap call: ticks since you were hit / last hit something, in combat, moving, walk destination, your target, NPCs attacking you, active prayers |
+| `observe` | Everything a decision loop reads, in one client-thread pass (~20 ms): vitals, boosts, combat state, inventory with item options, nearest NPCs / interactive objects / ground items, dialogue |
+
+### Decision loops
+
+| Tool | Description |
+|---|---|
+| `list_actions` | Every action available now as a numbered menu of plain labels ("Attack Goblin (lvl 2, 3 tiles)", "eat Shark", dialogue options), each with the tool + args behind it; optionally with the `observe` snapshot it was built from |
+| `act` | Run action `id` from the last menu; refuses a menu older than `maxAgeTicks` (default 3). Object ops are invoked directly, so the object need not be on screen |
 
 ### Raw input
 

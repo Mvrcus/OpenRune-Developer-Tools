@@ -51,6 +51,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +64,7 @@ import net.runelite.api.ActorSpotAnim;
 import net.runelite.api.Client;
 import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
+import net.runelite.api.GameState;
 import net.runelite.api.GroundObject;
 import net.runelite.api.Item;
 import net.runelite.api.ItemComposition;
@@ -83,6 +85,8 @@ import net.runelite.api.TileItem;
 import net.runelite.api.TileObject;
 import net.runelite.api.WallObject;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.widgets.Widget;
@@ -237,6 +241,32 @@ class McpTools
 			"One cheap call for whether the local player is fighting, moving or idle: ticks since a hitsplat landed on you and since one you dealt landed, inCombat (either within 8 ticks, Idle Notifier's rule), moving/animating, walk destination, and the NPC you are attacking plus every NPC attacking you.",
 			schema(props()),
 			args -> textResult(getCombatState()));
+
+		register("observe",
+			"Everything a decision loop reads each step, in ONE client-thread pass: tick, position, hp/prayer, run, combat state, inventory with each item's options, nearest NPCs/interactive objects/ground items, dialogue. Use instead of calling get_client_state, get_skills, get_inventory, list_* and get_dialogue separately.",
+			schema(props(
+				"maxDistance", "integer", "Only things within this many tiles (default 15)",
+				"maxNpcs", "integer", "Nearest NPCs to include (default 10)",
+				"maxObjects", "integer", "Nearest interactive objects to include (default 10)",
+				"maxItems", "integer", "Nearest ground items to include (default 6)")),
+			args -> textResult(observe(args)));
+
+		register("list_actions",
+			"Every action available right now as a numbered menu with plain-language labels (\"Attack Goblin (lvl 2, 3 tiles)\", \"eat Shark\", dialogue options), each with the tool + args that perform it. Built for small decision models that pick from a list. Run one with act(id). While a dialogue options menu is open, only its options are listed.",
+			schema(props(
+				"maxDistance", "integer", "Only things within this many tiles (default 15)",
+				"maxActions", "integer", "Cap on menu length (default 40)",
+				"dedupe", "boolean", "Keep only the nearest of identical actions, e.g. one 'Attack Goblin' (default true)",
+				"includeObservation", "boolean", "Also return the observe snapshot the menu was built from")),
+			args -> textResult(listActions(args)));
+
+		register("act",
+			"Run action `id` from the last list_actions menu. Fails if that menu is older than maxAgeTicks, so a stale choice is never executed.",
+			schema(props(
+				"id", "integer", "Action id from list_actions",
+				"maxAgeTicks", "integer", "Refuse menus older than this many game ticks (default 3)"),
+				"id"),
+			args -> textResult(act(args)));
 
 		register("set_prayer",
 			"Turn a prayer on or off in ONE call, without opening the prayer tab: e.g. prayer PROTECT_FROM_MAGIC, on true. Names are RuneLite Prayer enum names (PROTECT_FROM_MISSILES, PROTECT_FROM_MELEE, EAGLE_EYE, RIGOUR...). No-op when it is already in that state. Returns the active prayers afterwards.",
@@ -2096,63 +2126,499 @@ class McpTools
 
 	private JsonElement getCombatState() throws Exception
 	{
-		return onClientThread(() ->
+		return onClientThread(this::combatStateJson);
+	}
+
+	/** The get_combat_state payload. Must be called on the client thread. */
+	private JsonObject combatStateJson()
+	{
+		JsonObject o = new JsonObject();
+		Player local = client.getLocalPlayer();
+		if (local == null)
 		{
-			JsonObject o = new JsonObject();
-			Player local = client.getLocalPlayer();
-			if (local == null)
+			o.addProperty("loggedIn", false);
+			return o;
+		}
+		int tick = client.getTickCount();
+		int onMe = recorder.lastHitOnMeTick();
+		int mine = recorder.lastMyHitTick();
+		int sinceOnMe = onMe < 0 ? -1 : tick - onMe;
+		int sinceMine = mine < 0 ? -1 : tick - mine;
+		o.addProperty("tick", tick);
+		o.addProperty("ticksSinceHitOnMe", sinceOnMe);
+		o.addProperty("ticksSinceMyHit", sinceMine);
+		o.addProperty("inCombat", (sinceOnMe >= 0 && sinceOnMe <= COMBAT_WINDOW_TICKS)
+			|| (sinceMine >= 0 && sinceMine <= COMBAT_WINDOW_TICKS));
+		o.addProperty("animating", local.getAnimation() != -1);
+		o.addProperty("moving", local.getPoseAnimation() != local.getIdlePoseAnimation());
+		LocalPoint dest = client.getLocalDestinationLocation();
+		if (dest != null)
+		{
+			WorldPoint d = WorldPoint.fromLocal(client, dest);
+			o.addProperty("destination", d.getX() + "," + d.getY() + "," + d.getPlane());
+		}
+		Actor target = local.getInteracting();
+		if (target != null)
+		{
+			o.addProperty("target", target.getName());
+			if (target instanceof NPC)
 			{
-				o.addProperty("loggedIn", false);
-				return o;
-			}
-			int tick = client.getTickCount();
-			int onMe = recorder.lastHitOnMeTick();
-			int mine = recorder.lastMyHitTick();
-			int sinceOnMe = onMe < 0 ? -1 : tick - onMe;
-			int sinceMine = mine < 0 ? -1 : tick - mine;
-			o.addProperty("tick", tick);
-			o.addProperty("ticksSinceHitOnMe", sinceOnMe);
-			o.addProperty("ticksSinceMyHit", sinceMine);
-			o.addProperty("inCombat", (sinceOnMe >= 0 && sinceOnMe <= COMBAT_WINDOW_TICKS)
-				|| (sinceMine >= 0 && sinceMine <= COMBAT_WINDOW_TICKS));
-			o.addProperty("animating", local.getAnimation() != -1);
-			o.addProperty("moving", local.getPoseAnimation() != local.getIdlePoseAnimation());
-			LocalPoint dest = client.getLocalDestinationLocation();
-			if (dest != null)
-			{
-				WorldPoint d = WorldPoint.fromLocal(client, dest);
-				o.addProperty("destination", d.getX() + "," + d.getY() + "," + d.getPlane());
-			}
-			Actor target = local.getInteracting();
-			if (target != null)
-			{
-				o.addProperty("target", target.getName());
-				if (target instanceof NPC)
+				NPC npc = (NPC) target;
+				o.addProperty("targetIndex", npc.getIndex());
+				o.addProperty("targetDead", npc.isDead());
+				if (npc.getHealthScale() > 0)
 				{
-					NPC npc = (NPC) target;
-					o.addProperty("targetIndex", npc.getIndex());
-					o.addProperty("targetDead", npc.isDead());
-					if (npc.getHealthScale() > 0)
+					o.addProperty("targetHealthPercent", npc.getHealthRatio() * 100 / npc.getHealthScale());
+				}
+			}
+		}
+		JsonArray attackers = new JsonArray();
+		for (NPC npc : client.getNpcs())
+		{
+			if (npc.getInteracting() == local && !npc.isDead())
+			{
+				JsonObject a = new JsonObject();
+				a.addProperty("name", npc.getName());
+				a.addProperty("index", npc.getIndex());
+				a.addProperty("combatLevel", npc.getCombatLevel());
+				attackers.add(a);
+			}
+		}
+		o.add("attackers", attackers);
+		o.add("prayers", activePrayers());
+		return o;
+	}
+
+	// --- decision-loop tools: observe, list_actions, act ---
+
+	private static final MenuAction[] OBJECT_MENU_ACTIONS = {
+		MenuAction.GAME_OBJECT_FIRST_OPTION,
+		MenuAction.GAME_OBJECT_SECOND_OPTION,
+		MenuAction.GAME_OBJECT_THIRD_OPTION,
+		MenuAction.GAME_OBJECT_FOURTH_OPTION,
+		MenuAction.GAME_OBJECT_FIFTH_OPTION,
+	};
+
+	/** Ops list_actions never offers: they need a second target, or only inform. */
+	private static final Set<String> UNLISTED_OPS = Set.of("examine", "drop", "destroy", "use", "walk here", "cancel");
+
+	/** The runners behind the last list_actions menu, by action id, and the tick it was built on. */
+	private final List<Callable<JsonObject>> menuRunners = new ArrayList<>();
+	private int menuTick = -1;
+
+	private JsonElement observe(JsonObject args) throws Exception
+	{
+		int maxDistance = optInt(args, "maxDistance", 15);
+		int maxNpcs = optInt(args, "maxNpcs", 10);
+		int maxObjects = optInt(args, "maxObjects", 10);
+		int maxItems = optInt(args, "maxItems", 6);
+		return onClientThread(() -> observeNow(maxDistance, maxNpcs, maxObjects, maxItems));
+	}
+
+	/**
+	 * One compact snapshot of what a decision loop reads each step, built in a single client-thread
+	 * pass: vitals, combat state, inventory with item ops, nearest NPCs, interactive objects and
+	 * ground items, and dialogue. Must be called on the client thread.
+	 */
+	private JsonObject observeNow(int maxDistance, int maxNpcs, int maxObjects, int maxItems)
+	{
+		JsonObject o = new JsonObject();
+		Player local = client.getLocalPlayer();
+		if (client.getGameState() != GameState.LOGGED_IN || local == null)
+		{
+			o.addProperty("loggedIn", false);
+			return o;
+		}
+		WorldPoint me = local.getWorldLocation();
+		o.addProperty("loggedIn", true);
+		o.addProperty("tick", client.getTickCount());
+		o.addProperty("x", me.getX());
+		o.addProperty("y", me.getY());
+		o.addProperty("plane", me.getPlane());
+		o.addProperty("hp", client.getBoostedSkillLevel(Skill.HITPOINTS));
+		o.addProperty("hpMax", client.getRealSkillLevel(Skill.HITPOINTS));
+		o.addProperty("prayer", client.getBoostedSkillLevel(Skill.PRAYER));
+		o.addProperty("prayerMax", client.getRealSkillLevel(Skill.PRAYER));
+		o.addProperty("runEnergy", client.getEnergy() / 100);
+		o.addProperty("runOn", client.getVarpValue(VarPlayerID.OPTION_RUN) == 1);
+		JsonObject boosts = new JsonObject();
+		for (Skill skill : Skill.values())
+		{
+			int delta = client.getBoostedSkillLevel(skill) - client.getRealSkillLevel(skill);
+			if (delta != 0)
+			{
+				boosts.addProperty(skill.getName(), delta);
+			}
+		}
+		o.add("boosts", boosts);
+		o.add("combat", combatStateJson());
+
+		JsonArray inventory = new JsonArray();
+		ItemContainer container = client.getItemContainer(InventoryID.INV);
+		Item[] items = container != null ? container.getItems() : new Item[0];
+		for (int slot = 0; slot < items.length; slot++)
+		{
+			Item item = items[slot];
+			if (item == null || item.getId() == -1)
+			{
+				continue;
+			}
+			ItemComposition composition = client.getItemDefinition(item.getId());
+			JsonObject row = new JsonObject();
+			row.addProperty("slot", slot);
+			row.addProperty("itemId", item.getId());
+			row.addProperty("name", composition.getName());
+			row.addProperty("quantity", item.getQuantity());
+			row.add("actions", nonNull(composition.getInventoryActions()));
+			inventory.add(row);
+		}
+		o.add("inventory", inventory);
+
+		List<JsonObject> npcs = new ArrayList<>();
+		for (NPC npc : client.getNpcs())
+		{
+			JsonObject row = npc != null ? describeActor(npc, me, maxDistance) : null;
+			if (row == null)
+			{
+				continue;
+			}
+			NPCComposition comp = npc.getTransformedComposition() != null
+				? npc.getTransformedComposition()
+				: npc.getComposition();
+			row.addProperty("index", npc.getIndex());
+			row.addProperty("npcId", npc.getId());
+			row.add("actions", nonNull(comp != null ? comp.getActions() : null));
+			npcs.add(row);
+		}
+		o.add("npcs", nearest(npcs, maxNpcs));
+
+		Scene scene = client.getScene();
+		Tile[][] tiles = scene.getTiles()[client.getPlane()];
+		Set<GameObject> seen = new HashSet<>();
+		List<JsonObject> objects = new ArrayList<>();
+		List<JsonObject> ground = new ArrayList<>();
+		for (Tile[] column : tiles)
+		{
+			for (Tile tile : column)
+			{
+				if (tile == null)
+				{
+					continue;
+				}
+				for (TileObject obj : tileObjects(tile, seen))
+				{
+					JsonObject row = describeTileObject("object", obj, me, null, null, maxDistance);
+					if (row != null && row.has("name") && row.has("actions") && row.getAsJsonArray("actions").size() > 0)
 					{
-						o.addProperty("targetHealthPercent", npc.getHealthRatio() * 100 / npc.getHealthScale());
+						objects.add(row);
+					}
+				}
+				if (tile.getGroundItems() == null)
+				{
+					continue;
+				}
+				WorldPoint wp = tile.getWorldLocation();
+				int distance = me.distanceTo(wp);
+				if (distance > maxDistance)
+				{
+					continue;
+				}
+				for (TileItem item : tile.getGroundItems())
+				{
+					JsonObject row = new JsonObject();
+					row.addProperty("itemId", item.getId());
+					row.addProperty("name", client.getItemDefinition(item.getId()).getName());
+					row.addProperty("quantity", item.getQuantity());
+					row.addProperty("worldX", wp.getX());
+					row.addProperty("worldY", wp.getY());
+					row.addProperty("distance", distance);
+					ground.add(row);
+				}
+			}
+		}
+		o.add("objects", nearest(objects, maxObjects));
+		o.add("groundItems", nearest(ground, maxItems));
+		o.add("dialogue", readDialogue());
+		return o;
+	}
+
+	/** Game, wall, ground and decorative objects on a tile; multi-tile game objects once. */
+	private static List<TileObject> tileObjects(Tile tile, Set<GameObject> seen)
+	{
+		List<TileObject> out = new ArrayList<>();
+		if (tile.getGameObjects() != null)
+		{
+			for (GameObject go : tile.getGameObjects())
+			{
+				if (go != null && seen.add(go))
+				{
+					out.add(go);
+				}
+			}
+		}
+		if (tile.getWallObject() != null)
+		{
+			out.add(tile.getWallObject());
+		}
+		if (tile.getGroundObject() != null)
+		{
+			out.add(tile.getGroundObject());
+		}
+		if (tile.getDecorativeObject() != null)
+		{
+			out.add(tile.getDecorativeObject());
+		}
+		return out;
+	}
+
+	private static JsonArray nonNull(String[] values)
+	{
+		JsonArray out = new JsonArray();
+		if (values != null)
+		{
+			for (String v : values)
+			{
+				if (v != null && !v.isEmpty() && !"null".equals(v))
+				{
+					out.add(v);
+				}
+			}
+		}
+		return out;
+	}
+
+	private static JsonArray nearest(List<JsonObject> rows, int max)
+	{
+		rows.sort(Comparator.comparingInt(r -> r.has("distance") ? r.get("distance").getAsInt() : Integer.MAX_VALUE));
+		JsonArray out = new JsonArray();
+		rows.stream().limit(max).forEach(out::add);
+		return out;
+	}
+
+	/**
+	 * Every action available right now as a numbered menu, built from one observe pass. Each entry
+	 * is a plain-language label (what a small decision model picks from) plus the tool and arguments
+	 * that perform it; act(id) runs one.
+	 */
+	private JsonElement listActions(JsonObject args) throws Exception
+	{
+		boolean dedupe = !args.has("dedupe") || args.get("dedupe").getAsBoolean();
+		int maxActions = optInt(args, "maxActions", 40);
+		JsonObject obs = (JsonObject) observe(args);
+		JsonObject result = new JsonObject();
+		if (!obs.get("loggedIn").getAsBoolean())
+		{
+			result.addProperty("loggedIn", false);
+			return result;
+		}
+		JsonArray actions = new JsonArray();
+		List<Callable<JsonObject>> runners = new ArrayList<>();
+		Set<String> seen = new HashSet<>();
+		MenuBuilder menu = (label, kind, target, tool, toolArgs) ->
+		{
+			if (actions.size() >= maxActions || (dedupe && !seen.add(label.replaceAll(" \\(.*", ""))))
+			{
+				return;
+			}
+			JsonObject entry = new JsonObject();
+			entry.addProperty("id", actions.size());
+			entry.addProperty("label", label);
+			entry.addProperty("kind", kind);
+			entry.addProperty("target", target);
+			entry.addProperty("tool", tool);
+			entry.add("args", toolArgs);
+			actions.add(entry);
+			runners.add("object_op".equals(tool)
+				? () -> invokeObjectOp(toolArgs)
+				: () -> callTool(tool, toolArgs));
+		};
+
+		JsonObject dialogue = obs.getAsJsonObject("dialogue");
+		String dialogueType = dialogue.get("type").getAsString();
+		if ("options".equals(dialogueType))
+		{
+			// An options menu blocks everything else until it is answered.
+			for (JsonElement e : dialogue.getAsJsonArray("options"))
+			{
+				JsonObject opt = e.getAsJsonObject();
+				menu.add(Text.removeTags(opt.get("text").getAsString()), "dialogue", null, "select_option",
+					argsOf("option", opt.get("option")));
+			}
+		}
+		else
+		{
+			if (dialogue.has("canContinue") && dialogue.get("canContinue").getAsBoolean())
+			{
+				menu.add("continue the dialogue", "dialogue", null, "continue_dialogue", new JsonObject());
+			}
+			for (JsonElement e : obs.getAsJsonArray("npcs"))
+			{
+				JsonObject npc = e.getAsJsonObject();
+				if (npc.has("isDead"))
+				{
+					continue;
+				}
+				String name = npc.get("name").getAsString();
+				String detail = " (lvl " + npc.get("combatLevel").getAsInt() + ", " + npc.get("distance").getAsInt()
+					+ " tiles" + (npc.has("targetsMe") ? ", attacking you" : "") + ")";
+				for (JsonElement op : npc.getAsJsonArray("actions"))
+				{
+					if (!UNLISTED_OPS.contains(op.getAsString().toLowerCase()))
+					{
+						menu.add(op.getAsString() + " " + name + detail, "npc", name, "interact_npc",
+							argsOf("npcIndex", npc.get("index"), "option", op));
 					}
 				}
 			}
-			JsonArray attackers = new JsonArray();
-			for (NPC npc : client.getNpcs())
+			for (JsonElement e : obs.getAsJsonArray("objects"))
 			{
-				if (npc.getInteracting() == local && !npc.isDead())
+				JsonObject obj = e.getAsJsonObject();
+				for (JsonElement op : obj.getAsJsonArray("actions"))
 				{
-					JsonObject a = new JsonObject();
-					a.addProperty("name", npc.getName());
-					a.addProperty("index", npc.getIndex());
-					a.addProperty("combatLevel", npc.getCombatLevel());
-					attackers.add(a);
+					if (!UNLISTED_OPS.contains(op.getAsString().toLowerCase()))
+					{
+						menu.add(op.getAsString() + " " + obj.get("name").getAsString()
+								+ " (" + obj.get("distance").getAsInt() + " tiles)", "object", obj.get("name").getAsString(), "object_op",
+							argsOf("objectId", obj.get("objectId"), "x", obj.get("worldX"), "y", obj.get("worldY"),
+								"option", op));
+					}
 				}
 			}
-			o.add("attackers", attackers);
-			o.add("prayers", activePrayers());
-			return o;
+			for (JsonElement e : obs.getAsJsonArray("groundItems"))
+			{
+				JsonObject item = e.getAsJsonObject();
+				menu.add("take " + item.get("name").getAsString() + " (" + item.get("distance").getAsInt() + " tiles)",
+					"ground", item.get("name").getAsString(), "pickup_item",
+					argsOf("itemId", item.get("itemId"), "x", item.get("worldX"), "y", item.get("worldY")));
+			}
+			for (JsonElement e : obs.getAsJsonArray("inventory"))
+			{
+				JsonObject item = e.getAsJsonObject();
+				for (JsonElement op : item.getAsJsonArray("actions"))
+				{
+					if (!UNLISTED_OPS.contains(op.getAsString().toLowerCase()))
+					{
+						menu.add(op.getAsString().toLowerCase() + " " + item.get("name").getAsString(), "item", null,
+							"item_action", argsOf("itemId", item.get("itemId"), "option", op));
+					}
+				}
+			}
+		}
+
+		int tick = obs.get("tick").getAsInt();
+		synchronized (menuRunners)
+		{
+			menuRunners.clear();
+			menuRunners.addAll(runners);
+			menuTick = tick;
+		}
+		result.addProperty("tick", tick);
+		result.add("actions", actions);
+		if (args.has("includeObservation") && args.get("includeObservation").getAsBoolean())
+		{
+			result.add("observation", obs);
+		}
+		return result;
+	}
+
+	@FunctionalInterface
+	private interface MenuBuilder
+	{
+		void add(String label, String kind, String target, String tool, JsonObject toolArgs);
+	}
+
+	private static JsonObject argsOf(Object... pairs)
+	{
+		JsonObject o = new JsonObject();
+		for (int i = 0; i < pairs.length; i += 2)
+		{
+			o.add((String) pairs[i], (JsonElement) pairs[i + 1]);
+		}
+		return o;
+	}
+
+	private JsonElement act(JsonObject args) throws Exception
+	{
+		int id = args.get("id").getAsInt();
+		int maxAge = optInt(args, "maxAgeTicks", 3);
+		Callable<JsonObject> runner;
+		int age;
+		synchronized (menuRunners)
+		{
+			if (id < 0 || id >= menuRunners.size())
+			{
+				throw new IllegalArgumentException("No action " + id + " in the last list_actions menu ("
+					+ menuRunners.size() + " actions)");
+			}
+			runner = menuRunners.get(id);
+			age = client.getTickCount() - menuTick;
+		}
+		if (age > maxAge)
+		{
+			throw new IllegalStateException("The action menu is " + age + " ticks old; call list_actions again");
+		}
+		JsonObject result = runner.call();
+		result.addProperty("actionId", id);
+		return result;
+	}
+
+	/**
+	 * Invoke a scene object's op directly (the menu entry the client would build: scene x/y, object
+	 * id), so the object need not be on screen and the mouse never moves.
+	 */
+	private JsonObject invokeObjectOp(JsonObject args) throws Exception
+	{
+		int objectId = args.get("objectId").getAsInt();
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		String option = args.get("option").getAsString();
+		return onClientThread(() ->
+		{
+			int plane = client.getPlane();
+			LocalPoint lp = LocalPoint.fromWorld(client, new WorldPoint(x, y, plane));
+			if (lp == null)
+			{
+				throw new IllegalArgumentException("Tile " + x + "," + y + " is not in the loaded scene");
+			}
+			Tile tile = client.getScene().getTiles()[plane][lp.getSceneX()][lp.getSceneY()];
+			TileObject obj = tile == null ? null : tileObjects(tile, new HashSet<>()).stream()
+				.filter(o -> o.getId() == objectId).findFirst().orElse(null);
+			if (obj == null)
+			{
+				throw new IllegalArgumentException("Object " + objectId + " is no longer at " + x + "," + y);
+			}
+			ObjectComposition comp = client.getObjectDefinition(objectId);
+			if (comp.getImpostorIds() != null && comp.getImpostor() != null)
+			{
+				comp = comp.getImpostor();
+			}
+			String[] ops = comp.getActions();
+			int index = -1;
+			for (int i = 0; ops != null && i < ops.length && i < OBJECT_MENU_ACTIONS.length; i++)
+			{
+				if (ops[i] != null && ops[i].equalsIgnoreCase(option))
+				{
+					index = i;
+				}
+			}
+			if (index < 0)
+			{
+				throw new IllegalArgumentException(comp.getName() + " has no option '" + option + "'");
+			}
+			int sceneX = lp.getSceneX();
+			int sceneY = lp.getSceneY();
+			if (obj instanceof GameObject)
+			{
+				net.runelite.api.Point min = ((GameObject) obj).getSceneMinLocation();
+				sceneX = min.getX();
+				sceneY = min.getY();
+			}
+			client.menuAction(sceneX, sceneY, OBJECT_MENU_ACTIONS[index], objectId, -1, ops[index], comp.getName());
+			JsonObject result = new JsonObject();
+			result.addProperty("invoked", ops[index]);
+			result.addProperty("object", comp.getName());
+			result.addProperty("objectId", objectId);
+			return result;
 		});
 	}
 
