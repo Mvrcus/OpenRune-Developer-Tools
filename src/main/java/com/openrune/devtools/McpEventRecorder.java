@@ -75,6 +75,8 @@ class McpEventRecorder
 	private final Map<String, Integer> lastBoostedLevels = new HashMap<>();
 	private final Map<Integer, Map<Integer, Integer>> lastContainerContents = new HashMap<>();
 	private long seq = 1;
+	private int lastHitOnMeTick = -1;
+	private int lastMyHitTick = -1;
 
 	synchronized void recordScript(int scriptId, Object[] arguments, int tick)
 	{
@@ -171,6 +173,32 @@ class McpEventRecorder
 		}
 		entry.addProperty("message", message);
 		push(chat, CHAT_BUFFER, entry);
+	}
+
+	/**
+	 * Track the last tick a hitsplat landed on the local player, and the last tick one the local
+	 * player dealt landed (on anything), for get_combat_state.
+	 */
+	synchronized void recordCombatTick(boolean onMe, boolean mine, int tick)
+	{
+		if (onMe)
+		{
+			lastHitOnMeTick = tick;
+		}
+		if (mine && !onMe)
+		{
+			lastMyHitTick = tick;
+		}
+	}
+
+	synchronized int lastHitOnMeTick()
+	{
+		return lastHitOnMeTick;
+	}
+
+	synchronized int lastMyHitTick()
+	{
+		return lastMyHitTick;
 	}
 
 	synchronized void recordHitsplat(int hitsplatType, int amount, String actorType, String actorName,

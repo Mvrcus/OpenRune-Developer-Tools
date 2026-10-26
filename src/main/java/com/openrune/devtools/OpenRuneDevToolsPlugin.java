@@ -269,6 +269,7 @@ public class OpenRuneDevToolsPlugin extends Plugin
 			return;
 		}
 		Hitsplat hitsplat = event.getHitsplat();
+		recorder.recordCombatTick(actor == client.getLocalPlayer(), hitsplat.isMine(), client.getTickCount());
 		recorder.recordHitsplat(hitsplat.getHitsplatType(),
 			hitsplat.getAmount(),
 			actor instanceof NPC ? "npc" : "player",

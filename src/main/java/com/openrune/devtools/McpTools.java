@@ -74,6 +74,7 @@ import net.runelite.api.NPCComposition;
 import net.runelite.api.ObjectComposition;
 import net.runelite.api.Perspective;
 import net.runelite.api.Player;
+import net.runelite.api.Prayer;
 import net.runelite.api.Projectile;
 import net.runelite.api.Scene;
 import net.runelite.api.Skill;
@@ -88,6 +89,7 @@ import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetUtil;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.ui.DrawManager;
+import net.runelite.client.util.Text;
 
 /**
  * Implements the MCP tools exposed by {@link OpenRuneDevToolsPlugin}: screenshots,
@@ -230,6 +232,19 @@ class McpTools
 			"Get game state, canvas size, resized/fixed mode, mouse position, player world position/region, run energy, weight, camera yaw/pitch/zoom and whether a right-click menu is open.",
 			schema(props()),
 			args -> textResult(getClientState()));
+
+		register("get_combat_state",
+			"One cheap call for whether the local player is fighting, moving or idle: ticks since a hitsplat landed on you and since one you dealt landed, inCombat (either within 8 ticks, Idle Notifier's rule), moving/animating, walk destination, and the NPC you are attacking plus every NPC attacking you.",
+			schema(props()),
+			args -> textResult(getCombatState()));
+
+		register("set_prayer",
+			"Turn a prayer on or off in ONE call, without opening the prayer tab: e.g. prayer PROTECT_FROM_MAGIC, on true. Names are RuneLite Prayer enum names (PROTECT_FROM_MISSILES, PROTECT_FROM_MELEE, EAGLE_EYE, RIGOUR...). No-op when it is already in that state. Returns the active prayers afterwards.",
+			schema(props(
+				"prayer", "string", "Prayer enum name, e.g. PROTECT_FROM_MAGIC",
+				"on", "boolean", "true to activate (default), false to deactivate"),
+				"prayer"),
+			args -> textResult(setPrayer(args)));
 
 		register("get_skills",
 			"Local player skills: level, boosted level and xp per skill, plus total level. Hitpoints boosted level = current HP.",
@@ -1250,12 +1265,12 @@ class McpTools
 		{
 			throw new IllegalArgumentException("Provide itemId or itemName");
 		}
-		Point hover = onClientThread(() ->
+		Object found = onClientThread(() ->
 		{
 			Widget inventory = client.getWidget(InterfaceID.Inventory.ITEMS);
-			if (inventory == null || inventory.isHidden())
+			if (inventory == null)
 			{
-				throw new IllegalStateException("Inventory widget is not visible; open the inventory tab first");
+				throw new IllegalStateException("Inventory widget is not loaded");
 			}
 			Widget[] slots = inventory.getDynamicChildren();
 			if (slots != null)
@@ -1279,6 +1294,27 @@ class McpTools
 							continue;
 						}
 					}
+					// Invoke the slot's own op directly (CC_OP, identifier = op index + 1, as the client
+					// builds it), so this works with the inventory tab closed and never moves the mouse.
+					String[] ops = slot.getActions();
+					for (int i = 0; ops != null && i < ops.length; i++)
+					{
+						if (ops[i] != null && Text.removeTags(ops[i]).equalsIgnoreCase(option))
+						{
+							client.menuAction(slot.getIndex(), InterfaceID.Inventory.ITEMS,
+								i < 5 ? MenuAction.CC_OP : MenuAction.CC_OP_LOW_PRIORITY, i + 1,
+								slot.getItemId(), ops[i], slot.getName());
+							JsonObject result = new JsonObject();
+							result.addProperty("invoked", ops[i]);
+							result.addProperty("slot", slot.getIndex());
+							result.addProperty("itemId", slot.getItemId());
+							return result;
+						}
+					}
+					if (inventory.isHidden())
+					{
+						throw new IllegalStateException("Item has no '" + option + "' op and the inventory tab is closed");
+					}
 					Rectangle b = slot.getBounds();
 					if (b != null && b.width > 0 && b.height > 0)
 					{
@@ -1289,7 +1325,12 @@ class McpTools
 			throw new IllegalArgumentException("Item not found in inventory: "
 				+ (itemId != null ? "id " + itemId : itemName));
 		});
-		return hoverAndInvoke(hover, option, null);
+		if (found instanceof JsonObject)
+		{
+			return (JsonObject) found;
+		}
+		// Ops the slot doesn't list (e.g. server-added): fall back to hovering and reading the menu.
+		return hoverAndInvoke((Point) found, option, null);
 	}
 
 	private JsonElement widgetAction(JsonObject args) throws Exception
@@ -1996,6 +2037,15 @@ class McpTools
 					if (composition != null)
 					{
 						o.addProperty("name", composition.getName());
+						JsonArray actions = new JsonArray();
+						for (String action : composition.getInventoryActions())
+						{
+							if (action != null && !action.isEmpty())
+							{
+								actions.add(action);
+							}
+						}
+						o.add("inventoryActions", actions);
 					}
 				}
 				slots.add(o);
@@ -2037,6 +2087,120 @@ class McpTools
 			JsonObject result = new JsonObject();
 			result.addProperty("count", arr.size());
 			result.add("inventories", arr);
+			return result;
+		});
+	}
+
+	/** Ticks a monster may take between attacks before combat counts as over (Idle Notifier). */
+	private static final int COMBAT_WINDOW_TICKS = 8;
+
+	private JsonElement getCombatState() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonObject o = new JsonObject();
+			Player local = client.getLocalPlayer();
+			if (local == null)
+			{
+				o.addProperty("loggedIn", false);
+				return o;
+			}
+			int tick = client.getTickCount();
+			int onMe = recorder.lastHitOnMeTick();
+			int mine = recorder.lastMyHitTick();
+			int sinceOnMe = onMe < 0 ? -1 : tick - onMe;
+			int sinceMine = mine < 0 ? -1 : tick - mine;
+			o.addProperty("tick", tick);
+			o.addProperty("ticksSinceHitOnMe", sinceOnMe);
+			o.addProperty("ticksSinceMyHit", sinceMine);
+			o.addProperty("inCombat", (sinceOnMe >= 0 && sinceOnMe <= COMBAT_WINDOW_TICKS)
+				|| (sinceMine >= 0 && sinceMine <= COMBAT_WINDOW_TICKS));
+			o.addProperty("animating", local.getAnimation() != -1);
+			o.addProperty("moving", local.getPoseAnimation() != local.getIdlePoseAnimation());
+			LocalPoint dest = client.getLocalDestinationLocation();
+			if (dest != null)
+			{
+				WorldPoint d = WorldPoint.fromLocal(client, dest);
+				o.addProperty("destination", d.getX() + "," + d.getY() + "," + d.getPlane());
+			}
+			Actor target = local.getInteracting();
+			if (target != null)
+			{
+				o.addProperty("target", target.getName());
+				if (target instanceof NPC)
+				{
+					NPC npc = (NPC) target;
+					o.addProperty("targetIndex", npc.getIndex());
+					o.addProperty("targetDead", npc.isDead());
+					if (npc.getHealthScale() > 0)
+					{
+						o.addProperty("targetHealthPercent", npc.getHealthRatio() * 100 / npc.getHealthScale());
+					}
+				}
+			}
+			JsonArray attackers = new JsonArray();
+			for (NPC npc : client.getNpcs())
+			{
+				if (npc.getInteracting() == local && !npc.isDead())
+				{
+					JsonObject a = new JsonObject();
+					a.addProperty("name", npc.getName());
+					a.addProperty("index", npc.getIndex());
+					a.addProperty("combatLevel", npc.getCombatLevel());
+					attackers.add(a);
+				}
+			}
+			o.add("attackers", attackers);
+			o.add("prayers", activePrayers());
+			return o;
+		});
+	}
+
+	/** Active prayers as enum names. Must be called on the client thread. */
+	private JsonArray activePrayers()
+	{
+		JsonArray active = new JsonArray();
+		for (Prayer prayer : Prayer.values())
+		{
+			if (client.isPrayerActive(prayer))
+			{
+				active.add(prayer.name());
+			}
+		}
+		return active;
+	}
+
+	private JsonElement setPrayer(JsonObject args) throws Exception
+	{
+		Prayer prayer = Prayer.valueOf(args.get("prayer").getAsString().toUpperCase());
+		boolean on = !args.has("on") || args.get("on").getAsBoolean();
+		// "PROTECT_FROM_MAGIC" -> "protect from magic", matched against the prayer widgets' names.
+		String wanted = prayer.name().replace('_', ' ').toLowerCase();
+		return onClientThread(() ->
+		{
+			if (client.isPrayerActive(prayer) != on)
+			{
+				Widget button = null;
+				for (int i = 0; i < 30 && button == null; i++)
+				{
+					Widget w = client.getWidget(InterfaceID.Prayerbook.PRAYER1 + i);
+					String name = w != null && w.getName() != null ? Text.removeTags(w.getName()).toLowerCase() : "";
+					if (name.equals(wanted))
+					{
+						button = w;
+					}
+				}
+				if (button == null)
+				{
+					throw new IllegalArgumentException("No prayer button named '" + wanted + "' in the prayer book");
+				}
+				client.menuAction(-1, button.getId(), MenuAction.CC_OP, 1, -1,
+					on ? "Activate" : "Deactivate", button.getName());
+			}
+			JsonObject result = new JsonObject();
+			result.addProperty("prayer", prayer.name());
+			result.addProperty("requested", on);
+			result.add("prayers", activePrayers());
 			return result;
 		});
 	}
@@ -2401,6 +2565,14 @@ class McpTools
 		{
 			o.addProperty("interacting", interacting.getName());
 			o.addProperty("interactingType", interacting instanceof NPC ? "npc" : "player");
+			if (interacting instanceof NPC)
+			{
+				o.addProperty("interactingIndex", ((NPC) interacting).getIndex());
+			}
+			if (interacting == client.getLocalPlayer() && actor != interacting)
+			{
+				o.addProperty("targetsMe", true);
+			}
 		}
 		JsonArray spotAnims = new JsonArray();
 		for (ActorSpotAnim spotAnim : actor.getSpotAnims())
