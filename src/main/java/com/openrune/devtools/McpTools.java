@@ -268,6 +268,28 @@ class McpTools
 				"id"),
 			args -> textResult(act(args)));
 
+		register("close_interface",
+			"Press the Close button of every open interface that has one (bank, shop, menus) via its own op. Use before typing commands: an open bank or shop swallows them.",
+			schema(props()),
+			args -> textResult(closeInterfaces()));
+
+		register("bank",
+			"Use the open bank in ONE call: action deposit_inventory, or withdraw / deposit with itemId and quantity (1, 5, 10, all, or any number via the X amount prompt). Invokes the slot's own op, no hovering.",
+			schema(props(
+				"action", "string", "deposit_inventory, withdraw or deposit",
+				"itemId", "integer", "Item id (withdraw/deposit)",
+				"quantity", "string", "1, 5, 10, all, or a number (default 1)"),
+				"action"),
+			args -> textResult(bank(args)));
+
+		register("shop", "Buy from or sell to the open shop: action buy or sell, itemId, quantity. Uses the shop's Buy/Sell 1/5/10/50 ops largest-first; reports how many were clicked.",
+			schema(props(
+				"action", "string", "buy or sell",
+				"itemId", "integer", "Item id",
+				"quantity", "integer", "How many (default 1)"),
+				"action", "itemId"),
+			args -> textResult(shop(args)));
+
 		register("set_prayer",
 			"Turn a prayer on or off in ONE call, without opening the prayer tab: e.g. prayer PROTECT_FROM_MAGIC, on true. Names are RuneLite Prayer enum names (PROTECT_FROM_MISSILES, PROTECT_FROM_MELEE, EAGLE_EYE, RIGOUR...). No-op when it is already in that state. Returns the active prayers afterwards.",
 			schema(props(
@@ -815,6 +837,62 @@ class McpTools
 			JsonObject result = new JsonObject();
 			result.add("visibleInterfaceIds", toArray(visible));
 			result.add("loadedInterfaceIds", toArray(loaded));
+			return result;
+		});
+	}
+
+	/**
+	 * Press the Close button of every open interface that has one (bank, shop, menus), via its
+	 * own op. An open modal blocks typed commands and teleports, and ESC only closes it when the
+	 * player has that setting on.
+	 */
+	private JsonElement closeInterfaces() throws Exception
+	{
+		return onClientThread(() ->
+		{
+			JsonArray closed = new JsonArray();
+			Widget[] roots = client.getWidgetRoots();
+			Deque<Widget> queue = new ArrayDeque<>();
+			if (roots != null)
+			{
+				for (Widget root : roots)
+				{
+					if (root != null)
+					{
+						queue.add(root);
+					}
+				}
+			}
+			while (!queue.isEmpty())
+			{
+				Widget w = queue.poll();
+				try
+				{
+					if (w.isHidden())
+					{
+						continue;
+					}
+					String[] ops = w.getActions();
+					for (int i = 0; ops != null && i < ops.length; i++)
+					{
+						if (ops[i] != null && Text.removeTags(ops[i]).equalsIgnoreCase("Close"))
+						{
+							client.menuAction(w.getIndex(), w.getId(), MenuAction.CC_OP, i + 1, -1, ops[i], "");
+							closed.add(WidgetUtil.componentToInterface(w.getId()));
+							break;
+						}
+					}
+					enqueueChildren(queue, w.getStaticChildren());
+					enqueueChildren(queue, w.getNestedChildren());
+					enqueueChildren(queue, w.getDynamicChildren());
+				}
+				catch (RuntimeException e)
+				{
+					// Some widgets throw while their interface is mid-rebuild; skip them.
+				}
+			}
+			JsonObject result = new JsonObject();
+			result.add("closedInterfaces", closed);
 			return result;
 		});
 	}
@@ -2620,6 +2698,151 @@ class McpTools
 			result.addProperty("objectId", objectId);
 			return result;
 		});
+	}
+
+	// --- bank and shop ---
+
+	/**
+	 * Invoke `option` (case-insensitive, exact) on the slot holding `itemId` in a container widget,
+	 * as the client's own CC_OP entry. Returns null when the item is there but has no such op.
+	 * Must be called on the client thread.
+	 */
+	private JsonObject invokeSlotOp(int containerWidget, int itemId, String option)
+	{
+		Widget container = client.getWidget(containerWidget);
+		if (container == null || container.isHidden())
+		{
+			throw new IllegalStateException("That interface is not open");
+		}
+		Widget[] slots = container.getDynamicChildren();
+		for (Widget slot : slots == null ? new Widget[0] : slots)
+		{
+			if (slot == null || slot.getItemId() != itemId)
+			{
+				continue;
+			}
+			String[] ops = slot.getActions();
+			for (int i = 0; ops != null && i < ops.length; i++)
+			{
+				if (ops[i] != null && Text.removeTags(ops[i]).equalsIgnoreCase(option))
+				{
+					client.menuAction(slot.getIndex(), containerWidget,
+						i < 5 ? MenuAction.CC_OP : MenuAction.CC_OP_LOW_PRIORITY, i + 1, itemId, ops[i], slot.getName());
+					JsonObject result = new JsonObject();
+					result.addProperty("invoked", Text.removeTags(ops[i]));
+					result.addProperty("itemId", itemId);
+					return result;
+				}
+			}
+			return null;
+		}
+		throw new IllegalArgumentException("Item " + itemId + " is not in that interface");
+	}
+
+	/** Invoke a slot op, or fall back to `fallback` ("Withdraw-X") and type the amount. */
+	private JsonObject slotOpWithAmount(int containerWidget, int itemId, String option, String fallback, int amount)
+		throws Exception
+	{
+		JsonObject done = onClientThread(() -> invokeSlotOp(containerWidget, itemId, option));
+		if (done != null)
+		{
+			return done;
+		}
+		JsonObject x = onClientThread(() -> invokeSlotOp(containerWidget, itemId, fallback));
+		if (x == null)
+		{
+			throw new IllegalArgumentException("Item " + itemId + " has neither '" + option + "' nor '" + fallback + "'");
+		}
+		JsonObject input = new JsonObject();
+		input.addProperty("text", String.valueOf(amount));
+		callTool("wait_for", argsOf("condition", new com.google.gson.JsonPrimitive("dialogue"),
+			"timeoutMs", new com.google.gson.JsonPrimitive(3000)));
+		x.add("entered", callTool("enter_input", input));
+		return x;
+	}
+
+	private JsonElement bank(JsonObject args) throws Exception
+	{
+		String action = args.get("action").getAsString().toLowerCase();
+		JsonObject result;
+		switch (action)
+		{
+			case "deposit_inventory":
+				result = onClientThread(() ->
+				{
+					Widget button = client.getWidget(InterfaceID.Bankmain.DEPOSITINV);
+					if (button == null || button.isHidden())
+					{
+						throw new IllegalStateException("The bank is not open");
+					}
+					client.menuAction(-1, InterfaceID.Bankmain.DEPOSITINV, MenuAction.CC_OP, 1, -1,
+						"Deposit inventory", "");
+					JsonObject o = new JsonObject();
+					o.addProperty("invoked", "Deposit inventory");
+					return o;
+				});
+				break;
+			case "withdraw":
+			case "deposit":
+			{
+				int itemId = args.get("itemId").getAsInt();
+				String qty = args.has("quantity") ? args.get("quantity").getAsString().toLowerCase() : "1";
+				boolean withdraw = action.equals("withdraw");
+				String verb = withdraw ? "Withdraw-" : "Deposit-";
+				int widget = withdraw ? InterfaceID.Bankmain.ITEMS : InterfaceID.Bankside.ITEMS;
+				String option = verb + ("all".equals(qty) ? "All" : qty);
+				int amount = "all".equals(qty) ? Integer.MAX_VALUE : Integer.parseInt(qty);
+				result = slotOpWithAmount(widget, itemId, option, verb + "X", amount);
+				break;
+			}
+			default:
+				throw new IllegalArgumentException("action must be deposit_inventory, withdraw or deposit");
+		}
+		JsonObject contents = onClientThread(() ->
+		{
+			JsonObject o = new JsonObject();
+			ItemContainer bankInv = client.getItemContainer(InventoryID.BANK);
+			o.addProperty("bankItems", bankInv == null ? -1 : (int) java.util.Arrays.stream(bankInv.getItems())
+				.filter(i -> i != null && i.getId() != -1).count());
+			return o;
+		});
+		result.add("bank", contents);
+		return result;
+	}
+
+	private JsonElement shop(JsonObject args) throws Exception
+	{
+		String action = args.get("action").getAsString().toLowerCase();
+		int itemId = args.get("itemId").getAsInt();
+		int quantity = optInt(args, "quantity", 1);
+		boolean buy = action.equals("buy");
+		if (!buy && !action.equals("sell"))
+		{
+			throw new IllegalArgumentException("action must be buy or sell");
+		}
+		int widget = buy ? InterfaceID.Shopmain.ITEMS : InterfaceID.Shopside.ITEMS;
+		String verb = buy ? "Buy " : "Sell ";
+		// Shops offer fixed amounts (1/5/10/50): spend the quantity largest-first.
+		JsonArray clicks = new JsonArray();
+		int left = quantity;
+		for (int step : new int[]{50, 10, 5, 1})
+		{
+			while (left >= step)
+			{
+				JsonObject done = onClientThread(() -> invokeSlotOp(widget, itemId, verb + step));
+				if (done == null)
+				{
+					break;
+				}
+				clicks.add(done.get("invoked"));
+				left -= step;
+			}
+		}
+		JsonObject result = new JsonObject();
+		result.addProperty("requested", quantity);
+		result.addProperty("clicked", quantity - left);
+		result.add("ops", clicks);
+		return result;
 	}
 
 	/** Active prayers as enum names. Must be called on the client thread. */

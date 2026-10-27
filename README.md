@@ -162,6 +162,9 @@ automatically.
 | `click_menu_option` | Click an entry of the currently built mini-menu |
 | `item_action` | Invoke an inventory item's option (Drop, Eat, Wield...) directly; works with the inventory tab closed |
 | `set_prayer` | Turn a prayer on/off by name (`PROTECT_FROM_MAGIC`...) without opening the prayer tab |
+| `bank` | With the bank open: `deposit_inventory`, or `withdraw` / `deposit` an item by id (1, 5, 10, all, or any amount via the X prompt) |
+| `shop` | With a shop open: `buy` / `sell` an item by id and quantity, using the shop's 1/5/10/50 ops |
+| `close_interface` | Press the Close button of every open interface (bank, shop, menus) via its own op; an open bank or shop swallows typed commands |
 | `interact_object` | Nearest matching object, hover, click option (Chop down, Mine, Open...) |
 | `interact_player` | Hover a player and click an option (Trade with, Follow...) |
 | `widget_action` | Right-click any widget and click a menu option (spells, prayers, buttons) |
