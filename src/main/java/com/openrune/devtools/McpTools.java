@@ -1231,7 +1231,7 @@ class McpTools
 		long start = System.nanoTime();
 		JsonObject result = onClientThread(() -> findPath(x, y, width, height));
 		result.addProperty("searchMs", (System.nanoTime() - start) / 1_000_000.0);
-		return result;
+		return textResult(result);
 	}
 
 	private JsonObject findPath(int tx, int ty, int width, int height)
