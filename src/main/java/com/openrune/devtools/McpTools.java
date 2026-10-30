@@ -373,6 +373,18 @@ class McpTools
 				"x", "y"),
 			this::walkTo);
 
+		register("path_to",
+			"Plan a route through the loaded scene to a tile, treating closed doors, gates and other obstacles (Open, Climb-over, Squeeze-through, ...) as passable. "
+				+ "Returns the obstacles the route crosses, in order, so you can open each one and then walk on; an open route always wins over one through an obstacle. "
+				+ "found:false means the tile is walled off even with every obstacle open (a content bug, or it needs stairs, a ladder or a teleport). Pure computation, ~1 ms; never moves the player.",
+			schema(props(
+				"x", "integer", "World (map) x coordinate",
+				"y", "integer", "World (map) y coordinate",
+				"width", "integer", "Target width in tiles (default 1); a blocked target is reached from any tile beside it",
+				"height", "integer", "Target height in tiles (default 1)"),
+				"x", "y"),
+			this::pathTo);
+
 		register("list_npcs",
 			"List NPCs with id, index, name, combat level, actions, world location, distance, animation, facing, health (when visible) and canvas position, sorted by distance.",
 			schema(props(
@@ -1199,6 +1211,313 @@ class McpTools
 		String via = target.get("via").getAsString();
 		clickAt(cx, cy, MouseEvent.BUTTON1);
 		return textResult("Clicked " + via + " at " + cx + "," + cy + " to walk to " + x + "," + y);
+	}
+
+	/** Options that get a player through or over an obstacle; such objects count as passable. */
+	private static final Set<String> OBSTACLE_OPS = Set.of("open", "climb-over", "climb-through", "squeeze-through",
+		"crawl-through", "jump-over", "go-through", "pass", "walk-across", "cross", "jump-across", "balance-across");
+	/** Extra cost of crossing an obstacle, so an open route of up to this many more tiles wins. */
+	private static final int OBSTACLE_COST = 8;
+	private static final int BLOCK_FULL = 0x100 | 0x40000 | 0x200000;
+	private static final int WALL_NW = 0x1, WALL_N = 0x2, WALL_NE = 0x4, WALL_E = 0x8;
+	private static final int WALL_SE = 0x10, WALL_S = 0x20, WALL_SW = 0x40, WALL_W = 0x80;
+
+	private JsonObject pathTo(JsonObject args) throws Exception
+	{
+		int x = args.get("x").getAsInt();
+		int y = args.get("y").getAsInt();
+		int width = Math.max(1, optInt(args, "width", 1));
+		int height = Math.max(1, optInt(args, "height", 1));
+		long start = System.nanoTime();
+		JsonObject result = onClientThread(() -> findPath(x, y, width, height));
+		result.addProperty("searchMs", (System.nanoTime() - start) / 1_000_000.0);
+		return result;
+	}
+
+	private JsonObject findPath(int tx, int ty, int width, int height)
+	{
+		Player local = client.getLocalPlayer();
+		if (local == null || client.getCollisionMaps() == null)
+		{
+			throw new IllegalStateException("Not logged in");
+		}
+		int plane = client.getPlane();
+		int baseX = client.getBaseX();
+		int baseY = client.getBaseY();
+		int[][] live = client.getCollisionMaps()[plane].getFlags();
+		int w = live.length;
+		int h = live[0].length;
+		int gx = tx - baseX;
+		int gy = ty - baseY;
+		if (gx < 0 || gy < 0 || gx >= w || gy >= h)
+		{
+			throw new IllegalArgumentException("Tile " + tx + "," + ty + " is not in the loaded scene");
+		}
+
+		// The same map with every obstacle's collision removed; obstacleAt remembers which object
+		// a cleared tile belongs to, so a step that only the open map allows names its obstacle.
+		int[][] open = new int[w][];
+		for (int i = 0; i < w; i++)
+		{
+			open[i] = live[i].clone();
+		}
+		Map<Integer, JsonObject> obstacleAt = new LinkedHashMap<>();
+		Set<GameObject> seen = new HashSet<>();
+		for (Tile[] column : client.getScene().getTiles()[plane])
+		{
+			for (Tile tile : column)
+			{
+				if (tile == null)
+				{
+					continue;
+				}
+				for (TileObject obj : tileObjects(tile, seen))
+				{
+					JsonObject obstacle = describeObstacle(obj);
+					if (obstacle == null)
+					{
+						continue;
+					}
+					int sx = tile.getSceneLocation().getX();
+					int sy = tile.getSceneLocation().getY();
+					if (obj instanceof WallObject)
+					{
+						WallObject wall = (WallObject) obj;
+						clearWall(open, sx, sy, wall.getOrientationA() | wall.getOrientationB(), obstacleAt, obstacle);
+					}
+					else if (obj instanceof GameObject)
+					{
+						net.runelite.api.Point min = ((GameObject) obj).getSceneMinLocation();
+						net.runelite.api.Point max = ((GameObject) obj).getSceneMaxLocation();
+						for (int ix = Math.max(0, min.getX()); ix <= Math.min(w - 1, max.getX()); ix++)
+						{
+							for (int iy = Math.max(0, min.getY()); iy <= Math.min(h - 1, max.getY()); iy++)
+							{
+								open[ix][iy] &= ~BLOCK_FULL;
+								obstacleAt.putIfAbsent(ix * h + iy, obstacle);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		boolean targetBlocked = (live[gx][gy] & BLOCK_FULL) != 0;
+		LocalPoint here = local.getLocalLocation();
+		int from = here.getSceneX() * h + here.getSceneY();
+		int[] dist = new int[w * h];
+		int[] prev = new int[w * h];
+		java.util.Arrays.fill(dist, Integer.MAX_VALUE);
+		java.util.Arrays.fill(prev, -1);
+		dist[from] = 0;
+		java.util.PriorityQueue<int[]> queue = new java.util.PriorityQueue<>(Comparator.comparingInt(a -> a[0]));
+		queue.add(new int[]{0, from});
+		int goal = -1;
+		while (!queue.isEmpty())
+		{
+			int[] head = queue.poll();
+			int u = head[1];
+			if (head[0] > dist[u])
+			{
+				continue;
+			}
+			int ux = u / h;
+			int uy = u % h;
+			if (reached(open, ux, uy, gx, gy, width, height, targetBlocked))
+			{
+				goal = u;
+				break;
+			}
+			for (int dx = -1; dx <= 1; dx++)
+			{
+				for (int dy = -1; dy <= 1; dy++)
+				{
+					if ((dx == 0 && dy == 0) || !canMove(open, ux, uy, dx, dy))
+					{
+						continue;
+					}
+					int v = (ux + dx) * h + uy + dy;
+					int d = head[0] + 1 + (canMove(live, ux, uy, dx, dy) ? 0 : OBSTACLE_COST);
+					if (d < dist[v])
+					{
+						dist[v] = d;
+						prev[v] = u;
+						queue.add(new int[]{d, v});
+					}
+				}
+			}
+		}
+
+		JsonObject o = new JsonObject();
+		o.addProperty("found", goal >= 0);
+		if (goal < 0)
+		{
+			o.addProperty("message", "No route to " + tx + "," + ty + " even with every door and obstacle open: "
+				+ "it is walled off from here (a content bug, or it needs stairs, a ladder or a teleport)");
+			return o;
+		}
+		List<Integer> steps = new ArrayList<>();
+		for (int t = goal; t >= 0; t = prev[t])
+		{
+			steps.add(0, t);
+		}
+		JsonArray obstacles = new JsonArray();
+		JsonArray path = new JsonArray();
+		JsonObject last = null;
+		for (int i = 1; i < steps.size(); i++)
+		{
+			int a = steps.get(i - 1);
+			int b = steps.get(i);
+			int ax = a / h, ay = a % h, bx = b / h, by = b % h;
+			if (!canMove(live, ax, ay, bx - ax, by - ay))
+			{
+				JsonObject obstacle = obstacleAt.getOrDefault(b, obstacleAt.get(a));
+				if (obstacle != null && obstacle != last)
+				{
+					JsonObject crossing = obstacle.deepCopy();
+					crossing.addProperty("standX", ax + baseX);
+					crossing.addProperty("standY", ay + baseY);
+					obstacles.add(crossing);
+					last = obstacle;
+				}
+			}
+			// Waypoints: every turn, and the end.
+			boolean end = i == steps.size() - 1;
+			if (end || (steps.get(i + 1) - b) != (b - a))
+			{
+				JsonArray point = new JsonArray();
+				point.add(bx + baseX);
+				point.add(by + baseY);
+				path.add(point);
+			}
+		}
+		o.addProperty("direct", obstacles.size() == 0);
+		o.addProperty("length", steps.size() - 1);
+		o.add("obstacles", obstacles);
+		o.add("path", path);
+		return o;
+	}
+
+	/** The object's first obstacle option, as name/objectId/x/y/option, or null when it has none. */
+	private JsonObject describeObstacle(TileObject obj)
+	{
+		if (!(obj instanceof WallObject) && !(obj instanceof GameObject))
+		{
+			return null;
+		}
+		ObjectComposition comp = client.getObjectDefinition(obj.getId());
+		if (comp != null && comp.getImpostorIds() != null && comp.getImpostor() != null)
+		{
+			comp = comp.getImpostor();
+		}
+		if (comp == null || comp.getActions() == null)
+		{
+			return null;
+		}
+		for (String action : comp.getActions())
+		{
+			if (action != null && OBSTACLE_OPS.contains(action.toLowerCase()))
+			{
+				JsonObject o = new JsonObject();
+				o.addProperty("name", comp.getName());
+				o.addProperty("objectId", comp.getId());
+				o.addProperty("x", obj.getWorldLocation().getX());
+				o.addProperty("y", obj.getWorldLocation().getY());
+				o.addProperty("option", action);
+				return o;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Clears a wall's flags on its tile and the mirrored flag on the neighbour behind it.
+	 * Orientation bits: 1 W, 2 N, 4 E, 8 S, then the four diagonals; a diagonal wall blocks like an object.
+	 */
+	private static void clearWall(int[][] flags, int x, int y, int orientation, Map<Integer, JsonObject> at, JsonObject obstacle)
+	{
+		int[][] sides = {{1, -1, 0, WALL_W, WALL_E}, {2, 0, 1, WALL_N, WALL_S}, {4, 1, 0, WALL_E, WALL_W}, {8, 0, -1, WALL_S, WALL_N}};
+		int h = flags[0].length;
+		at.putIfAbsent(x * h + y, obstacle);
+		if (orientation == 0 || (orientation & 0xF0) != 0)
+		{
+			flags[x][y] &= ~(BLOCK_FULL | WALL_NW | WALL_NE | WALL_SE | WALL_SW);
+		}
+		for (int[] side : sides)
+		{
+			if ((orientation & side[0]) == 0 && orientation != 0)
+			{
+				continue;
+			}
+			flags[x][y] &= ~side[3];
+			int nx = x + side[1];
+			int ny = y + side[2];
+			if (nx >= 0 && ny >= 0 && nx < flags.length && ny < h)
+			{
+				flags[nx][ny] &= ~side[4];
+				at.putIfAbsent(nx * h + ny, obstacle);
+			}
+		}
+	}
+
+	/** On the target, or (for a blocked target) on a tile beside it with no wall in between. */
+	private static boolean reached(int[][] flags, int x, int y, int gx, int gy, int width, int height, boolean blocked)
+	{
+		boolean inside = x >= gx && x < gx + width && y >= gy && y < gy + height;
+		if (inside)
+		{
+			return true;
+		}
+		if (!blocked)
+		{
+			return false;
+		}
+		int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+		for (int[] d : dirs)
+		{
+			int nx = x + d[0];
+			int ny = y + d[1];
+			if (nx >= gx && nx < gx + width && ny >= gy && ny < gy + height && !wallBetween(flags, x, y, d[0], d[1]))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean wallBetween(int[][] flags, int x, int y, int dx, int dy)
+	{
+		int nx = x + dx;
+		int ny = y + dy;
+		if (nx < 0 || ny < 0 || nx >= flags.length || ny >= flags[0].length)
+		{
+			return true;
+		}
+		int facing = dx == 1 ? WALL_W : dx == -1 ? WALL_E : dy == 1 ? WALL_S : WALL_N;
+		return (flags[nx][ny] & facing) != 0;
+	}
+
+	/** The game's own step rule: the destination is free, and a diagonal also needs both of its sides. */
+	private static boolean canMove(int[][] flags, int x, int y, int dx, int dy)
+	{
+		int nx = x + dx;
+		int ny = y + dy;
+		if (nx < 0 || ny < 0 || nx >= flags.length || ny >= flags[0].length)
+		{
+			return false;
+		}
+		int dest = flags[nx][ny];
+		if (dx == 0 || dy == 0)
+		{
+			int facing = dx == 1 ? WALL_W : dx == -1 ? WALL_E : dy == 1 ? WALL_S : WALL_N;
+			return (dest & (facing | BLOCK_FULL)) == 0;
+		}
+		int sideX = dx == 1 ? WALL_W : WALL_E;
+		int sideY = dy == 1 ? WALL_S : WALL_N;
+		int corner = dx == 1 ? (dy == 1 ? WALL_SW : WALL_NW) : (dy == 1 ? WALL_SE : WALL_NE);
+		return (dest & (sideX | sideY | corner | BLOCK_FULL)) == 0
+			&& (flags[nx][y] & (sideX | BLOCK_FULL)) == 0
+			&& (flags[x][ny] & (sideY | BLOCK_FULL)) == 0;
 	}
 
 	private JsonElement listNpcs(JsonObject args) throws Exception
